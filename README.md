@@ -73,6 +73,7 @@ This project is ideal for:
 - [Frequently Asked Questions (FAQ)](FAQ.md) - Common setup and contribution questions
 - [Utilities Guide](docs/utilities.md) - All utility endpoints with use cases, curl examples, and sample responses
 - [Asset Endpoints Guide](docs/asset-endpoints.md) - All six asset endpoints with curl examples, sample responses, and guidance on when to use each one
+- [Liquidity Pool Guide](docs/liquidity-pool-guide.md) - All six liquidity pool endpoints with curl examples, pool share value computation, reserve-ratio health, profitability estimation, and a worked example for evaluating a pool position
 
 ---
 
