@@ -3257,6 +3257,112 @@ router.get("/:id/age", async (req, res, next) => {
 });
 
 /**
+ * GET /account/:id/transaction-velocity
+ *
+ * Returns transaction counts per hour for the last 24 hours, the peak hour,
+ * and a velocityScore (0–100) indicating how unusual the current rate is
+ * relative to the account's historical average.
+ *
+ * Response shape:
+ *   {
+ *     accountId,
+ *     hourlyBreakdown: [{ hour, timestamp, count }],  // 24 entries, oldest first
+ *     peakHour,        // ISO timestamp of the busiest hour, or null when inactive
+ *     peakCount,
+ *     averagePerHour,
+ *     velocityScore    // 0–100, 0 for inactive accounts
+ *   }
+ *
+ * @example
+ * GET /account/GABC.../transaction-velocity
+ */
+router.get("/:id/transaction-velocity", async (req, res, next) => {
+  try {
+    const { id } = req.params;
+    validateAccountId(id);
+
+    await withHorizonTiming(req, () => server.loadAccount(id));
+
+    const HOUR_MS = 60 * 60 * 1000;
+    const WINDOW_HOURS = 24;
+
+    // Align the window to the start of the current hour so buckets are stable.
+    const now = Date.now();
+    const currentHourStart = Math.floor(now / HOUR_MS) * HOUR_MS;
+    const windowStart = currentHourStart - (WINDOW_HOURS - 1) * HOUR_MS;
+
+    const hourlyBreakdown = [];
+    for (let i = 0; i < WINDOW_HOURS; i++) {
+      const bucketStart = windowStart + i * HOUR_MS;
+      hourlyBreakdown.push({
+        hour: new Date(bucketStart).toISOString(),
+        timestamp: new Date(bucketStart).toISOString(),
+        count: 0,
+      });
+    }
+
+    const txResponse = await server
+      .transactions()
+      .forAccount(id)
+      .order("desc")
+      .limit(200)
+      .call();
+    const records = txResponse.records || [];
+
+    let totalInWindow = 0;
+    let oldestSeen = null;
+    for (const tx of records) {
+      const createdAt = new Date(tx.created_at).getTime();
+      if (!Number.isFinite(createdAt)) continue;
+      if (oldestSeen === null || createdAt < oldestSeen) oldestSeen = createdAt;
+      if (createdAt < windowStart || createdAt > now) continue;
+      const bucketIndex = Math.floor((createdAt - windowStart) / HOUR_MS);
+      if (bucketIndex < 0 || bucketIndex >= WINDOW_HOURS) continue;
+      hourlyBreakdown[bucketIndex].count += 1;
+      totalInWindow += 1;
+    }
+
+    let peakHour = null;
+    let peakCount = 0;
+    for (const bucket of hourlyBreakdown) {
+      if (bucket.count > peakCount) {
+        peakCount = bucket.count;
+        peakHour = bucket.hour;
+      }
+    }
+
+    const averagePerHour = totalInWindow / WINDOW_HOURS;
+
+    // Historical average hourly rate: spread the fetched transactions over the
+    // span from the oldest fetched record to now. When the account has no
+    // activity at all, the velocity score is 0.
+    let velocityScore = 0;
+    if (totalInWindow > 0 && oldestSeen !== null) {
+      const spanHours = Math.max(1, (now - oldestSeen) / HOUR_MS);
+      const historicalAveragePerHour = records.length / spanHours;
+      const ratio =
+        historicalAveragePerHour > 0
+          ? averagePerHour / historicalAveragePerHour
+          : 0;
+      // A ratio of 1 (current rate matches history) maps to 50; higher ratios
+      // push the score toward 100, lower ratios toward 0.
+      velocityScore = Math.round(Math.max(0, Math.min(100, ratio * 50)));
+    }
+
+    return success(res, {
+      accountId: id,
+      hourlyBreakdown,
+      peakHour,
+      peakCount,
+      averagePerHour,
+      velocityScore,
+    });
+  } catch (err) {
+    handleAccountNotFound(err, next, req.params.id);
+  }
+});
+
+/**
  * GET /account/:id/transaction-count?since=<ISO8601>
  * Counts transactions for an account.
  *
