@@ -1520,6 +1520,143 @@ router.get("/liquidity-depth/:baseAsset/:counterAsset", async (req, res, next) =
 });
 
 /**
+ * @route GET /dex/price-impact/:sellAsset/:buyAsset
+ * @desc Estimates the price impact of a trade by walking the current order book asks for the requested sell amount.
+ * @param {import("express").Request} req - Express request object.
+ * @param {string} req.params.sellAsset - Asset being sold in `CODE:ISSUER` format or `XLM:native`.
+ * @param {string} req.params.buyAsset - Asset being bought in `CODE:ISSUER` format or `XLM:native`.
+ * @param {string} req.query.amount - Required amount of `sellAsset` to trade.
+ * @param {import("express").Response} res - Express response object.
+ * @param {import("express").NextFunction} next - Express next middleware function.
+ * @returns {Promise<void>} JSON payload with `pair`, `amount`, `estimatedFillPrice`, `marketPrice`, `priceImpactPercent`, and `warning`.
+ * @example
+ * curl -s "http://localhost:3000/dex/price-impact/XLM:native/FUSD:GBFUSDFICTIONALISSUERKEY000000000000000000000000000000?amount=500" | jq
+ * // {
+ * //   "success": true,
+ * //   "data": {
+ * //     "pair": "XLM:native/FUSD:GBFUSDFICTIONALISSUERKEY000000000000000000000000000000",
+ * //     "amount": "500.0000000",
+ * //     "estimatedFillPrice": "0.1289000",
+ * //     "marketPrice": "0.1284000",
+ * //     "priceImpactPercent": "0.3894",
+ * //     "warning": null
+ * //   }
+ * // }
+ */
+router.get("/price-impact/:sellAsset/:buyAsset", async (req, res, next) => {
+  try {
+    const { sellAsset, buyAsset } = req.params;
+
+    let selling, buying;
+    try {
+      selling = parseStellarAsset(sellAsset);
+      buying = parseStellarAsset(buyAsset);
+    } catch (err) {
+      return res.status(400).json({
+        success: false,
+        error: { type: "ValidationError", message: err.message },
+      });
+    }
+
+    const rawAmount = req.query.amount;
+    if (rawAmount === undefined || rawAmount === null || String(rawAmount).trim() === "") {
+      return res.status(400).json({
+        success: false,
+        error: { type: "ValidationError", message: "amount is required." },
+      });
+    }
+
+    const amountString = String(rawAmount).trim();
+    const parsedAmount = parseFloat(amountString);
+    if (!/^\d+(\.\d+)?$/.test(amountString) || !Number.isFinite(parsedAmount) || parsedAmount <= 0) {
+      return res.status(400).json({
+        success: false,
+        error: { type: "ValidationError", message: "amount must be a positive number." },
+      });
+    }
+
+    let orderBookResponse;
+    try {
+      orderBookResponse = await server.orderbook(selling, buying).limit(200).call();
+    } catch (err) {
+      if (err.response && err.response.status === 404) {
+        return res.status(404).json({
+          success: false,
+          error: makeOrderBookEmptyError(
+            selling.isNative() ? "XLM" : selling.getCode(),
+            buying.isNative() ? "XLM" : buying.getCode(),
+          ),
+        });
+      }
+      throw err;
+    }
+
+    const bids = orderBookResponse.bids || [];
+    const asks = orderBookResponse.asks || [];
+
+    if (bids.length === 0 && asks.length === 0) {
+      return res.status(404).json({
+        success: false,
+        error: makeOrderBookEmptyError(
+          selling.isNative() ? "XLM" : selling.getCode(),
+          buying.isNative() ? "XLM" : buying.getCode(),
+        ),
+      });
+    }
+
+    if (asks.length === 0) {
+      return res.status(404).json({
+        success: false,
+        error: makeOrderBookEmptyError(
+          selling.isNative() ? "XLM" : selling.getCode(),
+          buying.isNative() ? "XLM" : buying.getCode(),
+        ),
+      });
+    }
+
+    const marketPrice = parseFloat(asks[0].price);
+
+    // Walk the asks side, filling the requested amount at each price level.
+    let remaining = parsedAmount;
+    let filledAmount = 0;
+    let cost = 0;
+
+    for (const ask of asks) {
+      if (remaining <= 0) break;
+      const price = parseFloat(ask.price);
+      const levelAmount = parseFloat(ask.amount);
+      if (!Number.isFinite(price) || !Number.isFinite(levelAmount) || price <= 0 || levelAmount <= 0) {
+        continue;
+      }
+      const take = Math.min(remaining, levelAmount);
+      cost += take * price;
+      filledAmount += take;
+      remaining -= take;
+    }
+
+    const estimatedFillPrice = filledAmount > 0 ? cost / filledAmount : marketPrice;
+    const priceImpactPercent =
+      marketPrice > 0 ? ((estimatedFillPrice - marketPrice) / marketPrice) * 100 : 0;
+
+    let warning = null;
+    if (priceImpactPercent > 1) {
+      warning = `This trade is estimated to move the market price by ${priceImpactPercent.toFixed(2)}%, which exceeds 1%. Consider splitting the order into smaller trades.`;
+    }
+
+    return success(res, {
+      pair: `${sellAsset}/${buyAsset}`,
+      amount: parsedAmount.toFixed(7),
+      estimatedFillPrice: estimatedFillPrice.toFixed(7),
+      marketPrice: marketPrice.toFixed(7),
+      priceImpactPercent: priceImpactPercent.toFixed(4),
+      warning,
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+/**
  * Converts an SDK Asset instance into the standard { code, issuer, type } shape.
  *
  * @param {Asset} asset
