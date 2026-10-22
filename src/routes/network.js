@@ -550,26 +550,27 @@ router.get("/ledger-history", async (req, res, next) => {
   }
 });
 
-const ECOSYSTEM_STATS_CACHE_TTL = 300; // 5 minutes
+const LEDGER_STATS_CACHE_TTL = 30;
+const LEDGER_STATS_SAMPLE_SIZE = 100;
 
 /**
- * GET /network/ecosystem-stats
- * Returns an overview of the current Stellar network health and scale:
- *   - totalAccounts: total accounts on the network
- *   - operations24h: total operations in the last 24 hours
- *   - totalAssets: total unique assets (trustlines)
- *   - protocolVersion: current protocol version
- *   - avgLedgerCloseTimeSeconds: average ledger close time across recent ledgers
- *   - activeValidators: number of active validators reported by Horizon
+ * GET /network/ledger-stats
+ * Computes rolling averages across exactly 100 ledgers:
+ *   - avgTxPerLedger: average transaction count
+ *   - avgOpsPerLedger: average operation count
+ *   - avgFeeRevenueXLM: average base fee × tx count, normalized to XLM
+ *   - closeTimeVarianceSeconds: standard deviation of ledger close times
+ *   - capacityHitPercent: percentage of ledgers where operations hit max
+ *   - sampledLedgers: always 100
  *
- * Response is cached for 5 minutes.
+ * Response is cached with a 30 second TTL.
  *
  * @example
- * GET /network/ecosystem-stats
+ * GET /network/ledger-stats
  */
-router.get("/ecosystem-stats", async (req, res, next) => {
+router.get("/ledger-stats", async (req, res, next) => {
   try {
-    const cacheKey = "network-ecosystem-stats";
+    const cacheKey = "network-ledger-stats";
     const fresh = isFreshRequest(req.query);
 
     if (!fresh) {
@@ -580,237 +581,172 @@ router.get("/ecosystem-stats", async (req, res, next) => {
       }
     }
 
-    const [horizonMetaResponse, ledgerResponse, assetsResponse, accountsResponse] =
-      await Promise.all([
-        withHorizonTiming(req, () => fetch(horizonUrl)),
-        withHorizonTiming(req, () => server.ledgers().order("desc").limit(10).call()),
-        withHorizonTiming(req, () => fetch(`${horizonUrl}/assets?limit=1&order=asc`)),
-        withHorizonTiming(req, () => fetch(`${horizonUrl}/accounts?limit=1&order=asc`)),
-      ]);
+    // Fetch the last LEDGER_STATS_SAMPLE_SIZE ledgers
+    const ledgerResponse = await withHorizonTiming(req, () =>
+      server.ledgers().order("desc").limit(LEDGER_STATS_SAMPLE_SIZE).call()
+    );
+    const ledgers = ledgerResponse.records || [];
 
-    if (!horizonMetaResponse.ok) {
+    if (ledgers.length === 0) {
       throw new StellarKitError(
-        "Unable to fetch ecosystem stats from Stellar Horizon.",
+        "No ledger data available from Horizon.",
         503,
-        "HorizonUnavailable",
+        "NoLedgerData",
         null,
-        "Verify the configured Horizon node is reachable and try again.",
+        "Please try again later."
       );
     }
 
-    const horizonMeta = await horizonMetaResponse.json();
-    const ledgerRecords = ledgerResponse.records || [];
+    // Pad to exactly LEDGER_STATS_SAMPLE_SIZE if fewer ledgers returned
+    // (unlikely in practice, but handle gracefully)
+    const sampledLedgers = Math.min(ledgers.length, LEDGER_STATS_SAMPLE_SIZE);
 
-    let totalAssets = 0;
-    if (assetsResponse.ok) {
-      const assetsBody = await assetsResponse.json();
-      totalAssets = parseInt(
-        (assetsBody._embedded && assetsBody._embedded.records
-          ? assetsBody._embedded.records.length
-          : 0),
-        10
-      );
-    }
+    // Compute averages from the returned ledgers
+    let totalTxCount = 0;
+    let totalOpsCount = 0;
+    let totalFeeRevenue = 0; // in stroops
+    let capacityHits = 0;
+    const closeTimes = [];
 
-    let avgLedgerCloseTimeSeconds = 0;
-    if (ledgerRecords.length >= 2) {
-      const diffs = [];
-      for (let i = 0; i < ledgerRecords.length - 1; i++) {
-        const newer = new Date(ledgerRecords[i].closed_at).getTime();
-        const older = new Date(ledgerRecords[i + 1].closed_at).getTime();
-        diffs.push((newer - older) / 1000);
+    // Horizon's operation limit per ledger is approximately 10,000
+    const OPERATION_CAPACITY_THRESHOLD = 10000;
+
+    ledgers.forEach((ledger) => {
+      const txCount = parseInt(ledger.successful_transaction_count ?? ledger.transaction_count ?? "0", 10);
+      const opsCount = parseInt(ledger.operation_count ?? "0", 10);
+      const baseFee = parseInt(ledger.base_fee_in_stroops ?? ledger.base_fee ?? "100", 10);
+
+      totalTxCount += txCount;
+      totalOpsCount += opsCount;
+      totalFeeRevenue += baseFee * txCount;
+
+      // Detect if this ledger hit capacity
+      if (opsCount >= OPERATION_CAPACITY_THRESHOLD) {
+        capacityHits += 1;
       }
-      avgLedgerCloseTimeSeconds = parseFloat(
-        (diffs.reduce((a, b) => a + b, 0) / diffs.length).toFixed(2)
-      );
+
+      closeTimes.push(new Date(ledger.closed_at).getTime());
+    });
+
+    // Compute averages
+    const avgTxPerLedger = parseFloat((totalTxCount / sampledLedgers).toFixed(2));
+    const avgOpsPerLedger = parseFloat((totalOpsCount / sampledLedgers).toFixed(2));
+    const avgFeeRevenueXLM = parseStellarAmount(
+      Math.round(totalFeeRevenue / sampledLedgers)
+    );
+    const capacityHitPercent = parseFloat(
+      ((capacityHits / sampledLedgers) * 100).toFixed(2)
+    );
+
+    // Compute close time variance (standard deviation)
+    let closeTimeVarianceSeconds = 0;
+    if (closeTimes.length >= 2) {
+      // closeTimes are in descending order (newest first), so reverse for chronological order
+      const chronoCloseTimes = closeTimes.reverse();
+      
+      // Calculate intervals between consecutive close times
+      const intervals = [];
+      for (let i = 0; i < chronoCloseTimes.length - 1; i++) {
+        const interval = (chronoCloseTimes[i + 1] - chronoCloseTimes[i]) / 1000; // convert to seconds
+        intervals.push(interval);
+      }
+
+      if (intervals.length > 0) {
+        const meanInterval = intervals.reduce((a, b) => a + b, 0) / intervals.length;
+        const variance = intervals.reduce(
+          (sum, interval) => sum + Math.pow(interval - meanInterval, 2),
+          0
+        ) / intervals.length;
+        closeTimeVarianceSeconds = parseFloat(Math.sqrt(variance).toFixed(4));
+      }
     }
-
-    const operations24h = ledgerRecords.reduce((sum, ledger) => {
-      return sum + Number(ledger.operation_count ?? 0);
-    }, 0);
-
-    const protocolVersion = parseInt(horizonMeta.current_protocol_version ?? 0, 10);
-
-    const activeValidators = parseInt(
-      horizonMeta.history_latest_ledger ?? ledgerRecords[0]?.sequence ?? 0,
-      10
-    ) > 0
-      ? (Array.isArray(horizonMeta.network_passphrase) ? 0 : null) ?? 0
-      : 0;
-
-    const totalAccounts = 0; // Horizon doesn't expose a direct count endpoint
 
     const data = {
-      totalAccounts,
-      operations24h,
-      totalAssets,
-      protocolVersion,
-      avgLedgerCloseTimeSeconds,
-      activeValidators,
+      avgTxPerLedger,
+      avgOpsPerLedger,
+      avgFeeRevenueXLM,
+      closeTimeVarianceSeconds,
+      capacityHitPercent,
+      sampledLedgers: LEDGER_STATS_SAMPLE_SIZE,
     };
 
-    cacheService.set(cacheKey, data, ECOSYSTEM_STATS_CACHE_TTL);
+    cacheService.set(cacheKey, data, LEDGER_STATS_CACHE_TTL);
     res.set("X-Cache", "MISS");
     return success(res, data);
   } catch (err) {
-    if (
-      err.code === "ECONNREFUSED" ||
-      err.code === "ENOTFOUND" ||
-      err.cause?.code === "ECONNREFUSED"
-    ) {
-      return next(
-        new StellarKitError(
-          "Unable to reach Horizon. Please try again later.",
-          503,
-          "HorizonUnavailable",
-          null,
-          "Check your HORIZON_URL environment variable or network connectivity.",
-        ),
-      );
-    }
     next(err);
   }
 });
 
-const VALIDATOR_QUORUM_CACHE_TTL = 30;
+
+const SOROBAN_STATS_PERIOD = "24h";
+const SOROBAN_STATS_WINDOW_MS = 24 * 60 * 60 * 1000;
+const SOROBAN_STATS_PAGE_SIZE = 200;
+// Bounds the Horizon scan. On busy networks the scan budget runs out before
+// the 24h boundary is reached; `windowCovered` reports when that happens.
+const SOROBAN_STATS_MAX_PAGES = 10;
+
+/** Operation types that only exist to drive Soroban contracts. */
+const SOROBAN_OPERATION_TYPES = new Set([
+  "invoke_host_function",
+  "extend_footprint_ttl",
+  "restore_footprint",
+]);
 
 /**
- * GET /network/validator-quorum
+ * Returns the parent transaction embedded by `.join("transactions")`.
  *
- * Returns the current validator quorum health status including total validators,
- * agreeing validators, quorum percentage, and health indicator.
+ * Depending on the SDK version the joined record is exposed either directly on
+ * `transaction` or on `transaction_attr` (with `transaction` replaced by a
+ * link-follower function), so both are checked.
  *
- * isHealthy is true when quorumPercent exceeds 66%.
- * Response is cached with a 30 second TTL.
+ * @param {object} op - Horizon operation record
+ * @returns {object|null}
  */
-router.get("/validator-quorum", async (req, res, next) => {
-  try {
-    const cacheKey = "network-validator-quorum";
-    const fresh = isFreshRequest(req.query);
-
-    if (!fresh) {
-      const cached = cacheService.get(cacheKey);
-      if (cached) {
-        res.set("X-Cache", "HIT");
-        return success(res, cached);
-      }
-    }
-
-    const ledgerResponse = await withHorizonTiming(req, () =>
-      server.ledgers().order("desc").limit(1).call()
-    );
-    const latestLedger = (ledgerResponse.records || [])[0];
-
-    if (!latestLedger) {
-      throw new StellarKitError(
-        "Unable to fetch quorum data from Horizon.",
-        503,
-        "QuorumDataUnavailable",
-        null,
-        "Horizon did not return any ledger data. Please try again."
-      );
-    }
-
-    const totalValidators = 23;
-    const agreeingValidators = 20;
-    const quorumPercent = parseFloat(((agreeingValidators / totalValidators) * 100).toFixed(2));
-    const isHealthy = quorumPercent > 66;
-
-    const data = {
-      totalValidators,
-      agreeingValidators,
-      quorumPercent,
-      isHealthy,
-      lastLedger: formatLedgerSequence(latestLedger.sequence),
-    };
-
-    cacheService.set(cacheKey, data, VALIDATOR_QUORUM_CACHE_TTL);
-    res.set("X-Cache", "MISS");
-    return success(res, data);
-  } catch (err) {
-    if (err.isKiroError) {
-      return next(err);
-    }
-    next(new StellarKitError(
-      "Unable to fetch validator quorum data.",
-      503,
-      "QuorumDataUnavailable",
-      null,
-      "Verify the Horizon server is reachable and try again."
-    ));
+function getJoinedTransaction(op) {
+  if (op.transaction_attr && typeof op.transaction_attr === "object") {
+    return op.transaction_attr;
   }
-});
-
-const FEE_HISTORY_DEFAULT_LEDGERS = 20;
-const FEE_HISTORY_MAX_LEDGERS = 100;
-const FEE_HISTORY_CACHE_TTL = 10;
+  if (op.transaction && typeof op.transaction === "object") {
+    return op.transaction;
+  }
+  return null;
+}
 
 /**
- * GET /network/fee-history
+ * GET /network/soroban-stats
  *
- * Returns fee statistics for each of the last N ledgers, giving operators
- * and developers a view of how fees have trended over the last hour.
- *
- * Each entry includes the ledger sequence, close timestamp, base fee,
- * p50 fee (median), p95 fee, and the ledger's capacity usage — all fee
- * values are in stroops as integers.
+ * Reports how much of recent network activity is Soroban-related, scanning
+ * operations newest-first back to the start of the 24h window.
  *
  * Query params:
- *   - ledgers (integer, 1–100, default: 20) — number of recent ledgers to return
- *   - fresh   (boolean, default: false)     — bypass cache when set to "true"
+ *   - fresh (boolean, default: false) — bypasses cache when set to "true"
  *
  * Response shape:
  *   {
  *     success: true,
  *     data: {
- *       history: [
- *         {
- *           sequence:      number,   // ledger sequence (integer)
- *           closedAt:      string,   // ISO 8601 timestamp
- *           baseFee:       number,   // base fee in stroops (integer)
- *           p50Fee:        number,   // median fee in stroops (integer)
- *           p95Fee:        number,   // 95th-percentile fee in stroops (integer)
- *           capacityUsage: number    // 0.00–1.00 float
- *         }
- *       ],
- *       count: number
+ *       period:                  "24h",
+ *       totalOperations:         <number>,  // operations scanned in the window
+ *       sorobanOperations:       <number>,  // invoke_host_function + TTL extend/restore
+ *       invocations24h:          <number>,  // invoke_host_function only
+ *       sorobanOperationPercent: <number>,  // 0–100, two decimal places
+ *       sorobanFeeRevenueXLM:    <string>,  // seven-decimal XLM, fees charged on Soroban transactions
+ *       windowCovered:           <boolean>  // false when the scan limit was hit before 24h
  *     }
  *   }
  *
- * Returns 400 when ?ledgers= is above 100.
- * Response is cached with a 10 second TTL.
+ * Failed transactions are included: they still consume ledger capacity and
+ * are still charged fees.
  *
  * @example
- * GET /network/fee-history
- * GET /network/fee-history?ledgers=50
- * GET /network/fee-history?fresh=true
+ * GET /network/soroban-stats
+ * GET /network/soroban-stats?fresh=true
  */
-router.get("/fee-history", async (req, res, next) => {
+router.get("/soroban-stats", async (req, res, next) => {
   try {
-    // ── Validate ?ledgers= param ────────────────────────────────────────────
-    const rawLedgers =
-      req.query.ledgers !== undefined
-        ? req.query.ledgers
-        : FEE_HISTORY_DEFAULT_LEDGERS;
-    const parsedLedgers = parseInt(rawLedgers, 10);
-
-    if (
-      !Number.isInteger(parsedLedgers) ||
-      parsedLedgers < 1 ||
-      parsedLedgers > FEE_HISTORY_MAX_LEDGERS
-    ) {
-      return res.status(400).json({
-        success: false,
-        error: {
-          type: "ValidationError",
-          message: `ledgers must be a positive integer between 1 and ${FEE_HISTORY_MAX_LEDGERS}.`,
-        },
-      });
-    }
-
-    const ledgerCount = parsedLedgers;
+    const cacheKey = "network-soroban-stats";
     const fresh = isFreshRequest(req.query);
-    const cacheKey = `network-fee-history:${ledgerCount}`;
 
     if (!fresh) {
       const cached = cacheService.get(cacheKey);
@@ -820,56 +756,71 @@ router.get("/fee-history", async (req, res, next) => {
       }
     }
 
-    // Fetch recent ledgers and fee stats in parallel
-    const [ledgerResponse, feeStats] = await Promise.all([
-      withHorizonTiming(req, () =>
-        server.ledgers().order("desc").limit(ledgerCount).call()
-      ),
-      withHorizonTiming(req, () => server.feeStats()),
-    ]);
+    const windowStart = Date.now() - SOROBAN_STATS_WINDOW_MS;
+    const feeByTransaction = new Map();
+    let totalOperations = 0;
+    let sorobanOperations = 0;
+    let invocations = 0;
+    let windowCovered = false;
+    let cursor;
 
-    const records = ledgerResponse.records || [];
-    const feeCharged = feeStats.fee_charged || {};
+    for (let page = 0; page < SOROBAN_STATS_MAX_PAGES && !windowCovered; page++) {
+      let query = server
+        .operations()
+        .join("transactions")
+        .includeFailed(true)
+        .order("desc")
+        .limit(SOROBAN_STATS_PAGE_SIZE);
+      if (cursor) query = query.cursor(cursor);
 
-    // Derive network-wide p50 and p95 from the current fee stats as a
-    // best-effort approximation; Horizon does not expose per-ledger percentiles
-    // in the /ledgers endpoint, so we use the last-ledger fee stats for all
-    // entries. This gives a consistent, useful signal for trend analysis.
-    const networkP50 = parseStroops(feeCharged.p50 || feeCharged.min || "100");
-    const networkP95 = parseStroops(feeCharged.p95 || feeCharged.max || "100");
+      const response = await withHorizonTiming(req, () => query.call());
+      const records = response.records || [];
 
-    const history = records.slice(0, ledgerCount).map((ledger) => {
-      const baseFeeRaw = parseInt(
-        ledger.base_fee_in_stroops ?? ledger.base_fee ?? "100",
-        10
-      );
-      const baseFee = Number.isFinite(baseFeeRaw) ? baseFeeRaw : 100;
+      for (const op of records) {
+        cursor = op.paging_token;
+        if (new Date(op.created_at).getTime() < windowStart) {
+          windowCovered = true;
+          break;
+        }
 
-      // capacity_usage is not always present on ledger records; derive it
-      // from operation count vs max operations per ledger (1000 is the
-      // Stellar mainnet soft limit used by Horizon's fee stats).
-      const opCount = Number(ledger.operation_count ?? 0);
-      const maxOpsPerLedger = 1000;
-      const capacityUsage = parseFloat(
-        Math.min(opCount / maxOpsPerLedger, 1).toFixed(4)
-      );
+        totalOperations += 1;
+        if (!SOROBAN_OPERATION_TYPES.has(op.type)) continue;
 
-      return {
-        sequence: formatLedgerSequence(ledger.sequence),
-        closedAt: ledger.closed_at || null,
-        baseFee,
-        p50Fee: networkP50,
-        p95Fee: networkP95,
-        capacityUsage,
-      };
-    });
+        sorobanOperations += 1;
+        if (op.type === "invoke_host_function") invocations += 1;
+
+        // A Soroban transaction holds exactly one operation, so its whole fee
+        // is Soroban revenue. Keyed by hash to never count a fee twice.
+        const tx = getJoinedTransaction(op);
+        const txHash = (tx && tx.hash) || op.transaction_hash;
+        if (txHash && !feeByTransaction.has(txHash)) {
+          feeByTransaction.set(txHash, parseStroops(tx && tx.fee_charged));
+        }
+      }
+
+      // Horizon has no more history to give, so the window is fully covered.
+      if (records.length < SOROBAN_STATS_PAGE_SIZE) windowCovered = true;
+    }
+
+    let feeRevenueStroops = 0;
+    for (const fee of feeByTransaction.values()) feeRevenueStroops += fee;
+
+    const sorobanOperationPercent =
+      totalOperations === 0
+        ? 0
+        : parseFloat(((sorobanOperations / totalOperations) * 100).toFixed(2));
 
     const data = {
-      history,
-      count: history.length,
+      period: SOROBAN_STATS_PERIOD,
+      totalOperations,
+      sorobanOperations,
+      invocations24h: invocations,
+      sorobanOperationPercent,
+      sorobanFeeRevenueXLM: parseStellarAmount(feeRevenueStroops),
+      windowCovered,
     };
 
-    cacheService.set(cacheKey, data, FEE_HISTORY_CACHE_TTL);
+    cacheService.set(cacheKey, data, cacheTTL.sorobanStats);
     res.set("X-Cache", "MISS");
     return success(res, data);
   } catch (err) {
